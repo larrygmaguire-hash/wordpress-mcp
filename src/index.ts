@@ -460,9 +460,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
 
       case "wordpress_create_post": {
+        // Convert HTML content to Gutenberg blocks
+        const gutenbergContent = convertToGutenbergBlocks(params.content as string);
+
         const postBody: Record<string, unknown> = {
           title: params.title,
-          content: params.content,
+          content: gutenbergContent,
           status: params.status || "draft",
           categories: params.categories || [DEFAULT_CATEGORY_ID],
           tags: params.tags || DEFAULT_TAG_IDS,
@@ -493,7 +496,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const updateBody: Record<string, unknown> = {};
 
         if (params.title !== undefined) updateBody.title = params.title;
-        if (params.content !== undefined) updateBody.content = params.content;
+        // Convert HTML content to Gutenberg blocks
+        if (params.content !== undefined) {
+          updateBody.content = convertToGutenbergBlocks(params.content as string);
+        }
         if (params.status !== undefined) updateBody.status = params.status;
         if (params.categories !== undefined) updateBody.categories = params.categories;
         if (params.tags !== undefined) updateBody.tags = params.tags;
@@ -658,6 +664,64 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     };
   }
 });
+
+/**
+ * Convert HTML content to Gutenberg block format
+ * Wraps HTML elements in appropriate WordPress block comments
+ */
+function convertToGutenbergBlocks(html: string): string {
+  // If already contains block markers, return as-is
+  if (html.includes('<!-- wp:')) {
+    return html;
+  }
+
+  let result = '';
+
+  // Split by major block elements while preserving them
+  // Match: paragraphs, headings, lists, blockquotes, pre/code blocks
+  const blockRegex = /(<(?:p|h[1-6]|ul|ol|blockquote|pre|figure|hr)[^>]*>[\s\S]*?<\/(?:p|h[1-6]|ul|ol|blockquote|pre|figure)>|<hr\s*\/?>)/gi;
+
+  const parts = html.split(blockRegex).filter(part => part && part.trim());
+
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (!trimmed) continue;
+
+    // Determine block type from opening tag
+    if (trimmed.startsWith('<p')) {
+      result += `<!-- wp:paragraph -->\n${trimmed}\n<!-- /wp:paragraph -->\n\n`;
+    } else if (trimmed.match(/^<h1/i)) {
+      result += `<!-- wp:heading {"level":1} -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
+    } else if (trimmed.match(/^<h2/i)) {
+      result += `<!-- wp:heading -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
+    } else if (trimmed.match(/^<h3/i)) {
+      result += `<!-- wp:heading {"level":3} -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
+    } else if (trimmed.match(/^<h4/i)) {
+      result += `<!-- wp:heading {"level":4} -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
+    } else if (trimmed.match(/^<h5/i)) {
+      result += `<!-- wp:heading {"level":5} -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
+    } else if (trimmed.match(/^<h6/i)) {
+      result += `<!-- wp:heading {"level":6} -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
+    } else if (trimmed.match(/^<ul/i)) {
+      result += `<!-- wp:list -->\n${trimmed}\n<!-- /wp:list -->\n\n`;
+    } else if (trimmed.match(/^<ol/i)) {
+      result += `<!-- wp:list {"ordered":true} -->\n${trimmed}\n<!-- /wp:list -->\n\n`;
+    } else if (trimmed.match(/^<blockquote/i)) {
+      result += `<!-- wp:quote -->\n${trimmed}\n<!-- /wp:quote -->\n\n`;
+    } else if (trimmed.match(/^<pre/i)) {
+      result += `<!-- wp:code -->\n${trimmed}\n<!-- /wp:code -->\n\n`;
+    } else if (trimmed.match(/^<figure/i)) {
+      result += `<!-- wp:image -->\n${trimmed}\n<!-- /wp:image -->\n\n`;
+    } else if (trimmed.match(/^<hr/i)) {
+      result += `<!-- wp:separator -->\n<hr class="wp-block-separator has-alpha-channel-opacity"/>\n<!-- /wp:separator -->\n\n`;
+    } else {
+      // Wrap unknown content as paragraph
+      result += `<!-- wp:paragraph -->\n<p>${trimmed}</p>\n<!-- /wp:paragraph -->\n\n`;
+    }
+  }
+
+  return result.trim();
+}
 
 /**
  * Get MIME type from file extension
