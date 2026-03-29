@@ -1,6 +1,6 @@
 {
   "name": "wordpress-mcp",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "MCP server for WordPress REST API integration with humanperformance.ie",
   "type": "module",
   "main": "dist/index.js",

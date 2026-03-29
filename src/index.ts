@@ -25,8 +25,9 @@ const WORDPRESS_SITE_URL = process.env.WORDPRESS_SITE_URL || "https://humanperfo
 const WORDPRESS_USERNAME = process.env.WORDPRESS_USERNAME || "";
 const WORDPRESS_APP_PASSWORD = process.env.WORDPRESS_APP_PASSWORD || "";
 
-// API endpoint
+// API endpoints
 const API_BASE_URL = `${WORDPRESS_SITE_URL}/wp-json/wp/v2`;
+const XMLRPC_URL = `${WORDPRESS_SITE_URL}/xmlrpc.php`;
 
 // Default taxonomy IDs for TFOW articles
 const DEFAULT_CATEGORY_ID = 292; // Artificial Intelligence
@@ -112,7 +113,7 @@ async function wpRequest(
 const server = new Server(
   {
     name: "wordpress-mcp",
-    version: "1.0.0",
+    version: "1.1.0",
   },
   {
     capabilities: {
@@ -387,6 +388,35 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["file_path"],
       },
     },
+
+    // === YOAST SEO ===
+    {
+      name: "wordpress_set_yoast_meta",
+      description:
+        "Set Yoast SEO meta fields on a post (canonical URL, focus keyword, meta description). Uses XMLRPC to bypass Yoast's REST API restriction.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          post_id: {
+            type: "number",
+            description: "The WordPress post ID (required)",
+          },
+          canonical_url: {
+            type: "string",
+            description: "Canonical URL for the post (sets _yoast_wpseo_canonical)",
+          },
+          focus_keyword: {
+            type: "string",
+            description: "Yoast focus keyword (sets _yoast_wpseo_focuskw)",
+          },
+          meta_description: {
+            type: "string",
+            description: "Yoast meta description (sets _yoast_wpseo_metadesc)",
+          },
+        },
+        required: ["post_id"],
+      },
+    },
   ],
 }));
 
@@ -639,6 +669,35 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       }
 
+      // === YOAST SEO ===
+      case "wordpress_set_yoast_meta": {
+        const postId = params.post_id as number;
+        const fields: Record<string, string> = {};
+
+        if (params.canonical_url !== undefined) {
+          fields["_yoast_wpseo_canonical"] = params.canonical_url as string;
+        }
+        if (params.focus_keyword !== undefined) {
+          fields["_yoast_wpseo_focuskw"] = params.focus_keyword as string;
+        }
+        if (params.meta_description !== undefined) {
+          fields["_yoast_wpseo_metadesc"] = params.meta_description as string;
+        }
+
+        if (Object.keys(fields).length === 0) {
+          throw new Error("At least one Yoast field must be provided (canonical_url, focus_keyword, or meta_description)");
+        }
+
+        const yoastResult = await setYoastMeta(postId, fields);
+
+        result = {
+          post_id: postId,
+          fields_set: yoastResult.fieldsSet,
+          message: `Yoast meta updated successfully on post ${postId}`,
+        };
+        break;
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -666,57 +725,149 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 });
 
 /**
- * Convert HTML content to Gutenberg block format
- * Wraps HTML elements in appropriate WordPress block comments
+ * Convert HTML content to Gutenberg block format.
+ * Extracts top-level HTML elements and wraps each in the appropriate
+ * WordPress block comment. Handles nested tags (e.g. blockquote
+ * containing <p>) by tracking open/close tag depth.
  */
 function convertToGutenbergBlocks(html: string): string {
-  // If already contains block markers, return as-is
-  if (html.includes('<!-- wp:')) {
+  if (html.includes("<!-- wp:")) {
     return html;
   }
 
-  let result = '';
+  // Extract top-level block elements by walking the string and
+  // tracking tag depth so nested tags don't cause premature splits.
+  const blocks: string[] = [];
+  const blockTags = new Set([
+    "p", "h1", "h2", "h3", "h4", "h5", "h6",
+    "ul", "ol", "blockquote", "pre", "figure",
+    "table", "hr", "div",
+  ]);
 
-  // Split by major block elements while preserving them
-  // Match: paragraphs, headings, lists, blockquotes, pre/code blocks
-  const blockRegex = /(<(?:p|h[1-6]|ul|ol|blockquote|pre|figure|hr)[^>]*>[\s\S]*?<\/(?:p|h[1-6]|ul|ol|blockquote|pre|figure)>|<hr\s*\/?>)/gi;
+  let i = 0;
+  const len = html.length;
 
-  const parts = html.split(blockRegex).filter(part => part && part.trim());
+  while (i < len) {
+    // Skip whitespace between blocks
+    if (/\s/.test(html[i])) { i++; continue; }
 
-  for (const part of parts) {
-    const trimmed = part.trim();
-    if (!trimmed) continue;
+    // Must start with '<'
+    if (html[i] !== "<") {
+      // Stray text outside a tag — collect until next '<'
+      const nextTag = html.indexOf("<", i);
+      const text = html.slice(i, nextTag === -1 ? len : nextTag).trim();
+      if (text) blocks.push(`<p>${text}</p>`);
+      i = nextTag === -1 ? len : nextTag;
+      continue;
+    }
 
-    // Determine block type from opening tag
-    if (trimmed.startsWith('<p')) {
-      result += `<!-- wp:paragraph -->\n${trimmed}\n<!-- /wp:paragraph -->\n\n`;
-    } else if (trimmed.match(/^<h1/i)) {
-      result += `<!-- wp:heading {"level":1} -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
-    } else if (trimmed.match(/^<h2/i)) {
-      result += `<!-- wp:heading -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
-    } else if (trimmed.match(/^<h3/i)) {
-      result += `<!-- wp:heading {"level":3} -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
-    } else if (trimmed.match(/^<h4/i)) {
-      result += `<!-- wp:heading {"level":4} -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
-    } else if (trimmed.match(/^<h5/i)) {
-      result += `<!-- wp:heading {"level":5} -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
-    } else if (trimmed.match(/^<h6/i)) {
-      result += `<!-- wp:heading {"level":6} -->\n${trimmed}\n<!-- /wp:heading -->\n\n`;
-    } else if (trimmed.match(/^<ul/i)) {
-      result += `<!-- wp:list -->\n${trimmed}\n<!-- /wp:list -->\n\n`;
-    } else if (trimmed.match(/^<ol/i)) {
-      result += `<!-- wp:list {"ordered":true} -->\n${trimmed}\n<!-- /wp:list -->\n\n`;
-    } else if (trimmed.match(/^<blockquote/i)) {
-      result += `<!-- wp:quote -->\n${trimmed}\n<!-- /wp:quote -->\n\n`;
-    } else if (trimmed.match(/^<pre/i)) {
-      result += `<!-- wp:code -->\n${trimmed}\n<!-- /wp:code -->\n\n`;
-    } else if (trimmed.match(/^<figure/i)) {
-      result += `<!-- wp:image -->\n${trimmed}\n<!-- /wp:image -->\n\n`;
-    } else if (trimmed.match(/^<hr/i)) {
-      result += `<!-- wp:separator -->\n<hr class="wp-block-separator has-alpha-channel-opacity"/>\n<!-- /wp:separator -->\n\n`;
-    } else {
-      // Wrap unknown content as paragraph
-      result += `<!-- wp:paragraph -->\n<p>${trimmed}</p>\n<!-- /wp:paragraph -->\n\n`;
+    // Read the tag name
+    const tagMatch = html.slice(i).match(/^<([a-z][a-z0-9]*)/i);
+    if (!tagMatch) { i++; continue; }
+
+    const tagName = tagMatch[1].toLowerCase();
+
+    // Self-closing tags
+    if (tagName === "hr") {
+      const end = html.indexOf(">", i);
+      blocks.push(html.slice(i, end + 1));
+      i = end + 1;
+      continue;
+    }
+
+    if (!blockTags.has(tagName)) {
+      // Inline or unknown — collect until next block-level tag
+      const nextBlock = html.slice(i + 1).search(/<(?:p|h[1-6]|ul|ol|blockquote|pre|figure|table|hr|div)[\s>]/i);
+      const chunk = nextBlock === -1
+        ? html.slice(i).trim()
+        : html.slice(i, i + 1 + nextBlock).trim();
+      if (chunk) blocks.push(chunk);
+      i = nextBlock === -1 ? len : i + 1 + nextBlock;
+      continue;
+    }
+
+    // Track depth to find the matching close tag
+    let depth = 0;
+    let j = i;
+    while (j < len) {
+      const openIdx = html.indexOf(`<${tagName}`, j);
+      const closeIdx = html.indexOf(`</${tagName}>`, j);
+
+      if (closeIdx === -1) {
+        // No close tag found — take rest of string
+        j = len;
+        break;
+      }
+
+      if (openIdx !== -1 && openIdx < closeIdx && openIdx !== i) {
+        // Found a nested open tag before the close tag
+        depth++;
+        j = openIdx + tagName.length + 1;
+      } else if (depth > 0) {
+        depth--;
+        j = closeIdx + tagName.length + 3;
+      } else {
+        // This close tag matches our open tag
+        j = closeIdx + tagName.length + 3; // past </tagName>
+        break;
+      }
+    }
+
+    blocks.push(html.slice(i, j).trim());
+    i = j;
+  }
+
+  // Wrap each block in the appropriate Gutenberg comment
+  let result = "";
+  for (const block of blocks) {
+    const tag = block.match(/^<([a-z][a-z0-9]*)/i)?.[1]?.toLowerCase() || "";
+
+    switch (tag) {
+      case "p":
+        result += `<!-- wp:paragraph -->\n${block}\n<!-- /wp:paragraph -->\n\n`;
+        break;
+      case "h1":
+        result += `<!-- wp:heading {"level":1} -->\n${block}\n<!-- /wp:heading -->\n\n`;
+        break;
+      case "h2":
+        result += `<!-- wp:heading -->\n${block}\n<!-- /wp:heading -->\n\n`;
+        break;
+      case "h3":
+        result += `<!-- wp:heading {"level":3} -->\n${block}\n<!-- /wp:heading -->\n\n`;
+        break;
+      case "h4":
+        result += `<!-- wp:heading {"level":4} -->\n${block}\n<!-- /wp:heading -->\n\n`;
+        break;
+      case "h5":
+        result += `<!-- wp:heading {"level":5} -->\n${block}\n<!-- /wp:heading -->\n\n`;
+        break;
+      case "h6":
+        result += `<!-- wp:heading {"level":6} -->\n${block}\n<!-- /wp:heading -->\n\n`;
+        break;
+      case "ul":
+        result += `<!-- wp:list -->\n${block}\n<!-- /wp:list -->\n\n`;
+        break;
+      case "ol":
+        result += `<!-- wp:list {"ordered":true} -->\n${block}\n<!-- /wp:list -->\n\n`;
+        break;
+      case "blockquote":
+        result += `<!-- wp:quote -->\n${block}\n<!-- /wp:quote -->\n\n`;
+        break;
+      case "pre":
+        result += `<!-- wp:code -->\n${block}\n<!-- /wp:code -->\n\n`;
+        break;
+      case "figure":
+        result += `<!-- wp:image -->\n${block}\n<!-- /wp:image -->\n\n`;
+        break;
+      case "table":
+        result += `<!-- wp:table -->\n<figure class="wp-block-table">${block}</figure>\n<!-- /wp:table -->\n\n`;
+        break;
+      case "hr":
+        result += `<!-- wp:separator -->\n<hr class="wp-block-separator has-alpha-channel-opacity"/>\n<!-- /wp:separator -->\n\n`;
+        break;
+      default:
+        result += `<!-- wp:html -->\n${block}\n<!-- /wp:html -->\n\n`;
+        break;
     }
   }
 
@@ -742,6 +893,88 @@ function getMimeType(filename: string): string {
     ".wav": "audio/wav",
   };
   return mimeTypes[ext] || "application/octet-stream";
+}
+
+/**
+ * Set Yoast SEO meta fields on a post via XMLRPC
+ * Uses wp.editPost with custom_fields since Yoast doesn't expose
+ * its meta fields through the REST API by default.
+ */
+async function setYoastMeta(
+  postId: number,
+  fields: Record<string, string>
+): Promise<{ success: boolean; fieldsSet: string[] }> {
+  if (!WORDPRESS_USERNAME || !WORDPRESS_APP_PASSWORD) {
+    throw new Error("WordPress credentials not configured.");
+  }
+
+  const cleanPassword = WORDPRESS_APP_PASSWORD.replace(/\s/g, "");
+
+  // Build custom_fields array for XMLRPC
+  const customFieldsXml = Object.entries(fields)
+    .map(
+      ([key, value]) => `
+          <value><struct>
+            <member><name>key</name><value><string>${escapeXml(key)}</string></value></member>
+            <member><name>value</name><value><string>${escapeXml(value)}</string></value></member>
+          </struct></value>`
+    )
+    .join("");
+
+  const xmlPayload = `<?xml version="1.0"?>
+<methodCall>
+  <methodName>wp.editPost</methodName>
+  <params>
+    <param><value><int>1</int></value></param>
+    <param><value><string>${escapeXml(WORDPRESS_USERNAME)}</string></value></param>
+    <param><value><string>${escapeXml(cleanPassword)}</string></value></param>
+    <param><value><int>${postId}</int></value></param>
+    <param><value><struct>
+      <member>
+        <name>custom_fields</name>
+        <value><array><data>${customFieldsXml}
+        </data></array></value>
+      </member>
+    </struct></value></param>
+  </params>
+</methodCall>`;
+
+  const response = await fetch(XMLRPC_URL, {
+    method: "POST",
+    headers: { "Content-Type": "text/xml" },
+    body: xmlPayload,
+  });
+
+  if (!response.ok) {
+    throw new Error(`XMLRPC request failed: ${response.status} ${response.statusText}`);
+  }
+
+  const responseText = await response.text();
+
+  // Check for XMLRPC fault
+  if (responseText.includes("<fault>")) {
+    const faultMatch = responseText.match(/<string>([^<]*)<\/string>/);
+    throw new Error(`XMLRPC fault: ${faultMatch?.[1] || "Unknown error"}`);
+  }
+
+  // Check for success (boolean true)
+  if (responseText.includes("<boolean>1</boolean>")) {
+    return { success: true, fieldsSet: Object.keys(fields) };
+  }
+
+  throw new Error("XMLRPC returned unexpected response");
+}
+
+/**
+ * Escape special characters for XML
+ */
+function escapeXml(str: string): string {
+  return str
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
 }
 
 // Start the server
